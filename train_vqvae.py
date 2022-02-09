@@ -17,19 +17,21 @@ from torch.nn.parallel import DistributedDataParallel
 
 from encoders.Midi2NumpyEncoder import Midi2NumpyEncoder
 from encoders.ImgEncoder import *
-from utils.schedulers import InversePowerWithWarmupLRScheduler
+from models.vae_linear import Model
+from utils.schedulers import InversePowerWithWarmupLRScheduler, LambdaWarmUpCosineScheduler
+from utils.tracker import Tracker
 
 
 params = dict(
     SEED = 0,
-    NAME = 'lakh_4t_19k_gumbel_vq_test',
+    NAME = 'lakh_4t_19k_soft_vq_liear_test',
 #     DS_DIR = 'data/youtube_23k_final_CNNEncoder/',
     num_epochs = 300,
     batch_size = 16,
-    num_workers = 3,
+    num_workers = 0,
     val_every = 2000,
     save_every = 2000,
-    lr = 1e-4,
+    lr = 1e-3,
     use_scheduler = False,
     peak_lr = 1e-4,
     warmup_steps = 1500,
@@ -84,27 +86,18 @@ def create_dataloaders(batch_size, num_workers=0):
 
 def init_model(lr, seed=0):
     print('loading model...')
-    from structures.vq_vae_taming import GumbelVQ, SoftQuantize
-    from utils.schedulers import LambdaWarmUpCosineScheduler
     
     torch.manual_seed(seed)
     
-    ddconfig = {'double_z': False, 'z_channels': 256, 'resolution': 256, 'in_channels': 1, 'out_ch': 1, 'ch': 128, 'ch_mult': [1, 2, 4], 'num_res_blocks': 2, 'attn_resolutions': [16], 'dropout': 0.0}
     model_params = dict(
-        ddconfig = ddconfig,
-        n_embed = 512,
-        embed_dim = 256,
-        kl_weight = 1e-6,
     )
 
-    model = GumbelVQ(**model_params).to(device)
-#     model.quantize = SoftQuantize(512, 512).to(device)
-    model.out_act = nn.Identity()
+    model = Model().to(device)
     
-    locals().update(model_params)
+#     locals().update(model_params)
     params['config'] = model_params
     
-    temp_scheduler = LambdaWarmUpCosineScheduler(0, 1e-6, 0.9, 0.9, 300000)    
+    temp_scheduler = LambdaWarmUpCosineScheduler(0, 0.01, 0.9, 0.9, 200000)
 
     print(sum((torch.numel(x) for x in model.parameters()))/1e6, 'M parameters')
     optimizer = torch.optim.AdamW(model.parameters(), lr, weight_decay=1e-5)
@@ -124,7 +117,7 @@ def init_model(lr, seed=0):
     return model, optimizer, temp_scheduler
 
 
-def validate(model, val_loader):
+def validate(model, val_loader, tracker_val):
     n, CE, ACC = 0, 0, 0
     model.eval()
     with torch.no_grad():
@@ -137,8 +130,10 @@ def validate(model, val_loader):
             n += mask.sum().item()
             CE += loss.item()
             
+    metric = metrics(x.detach().cpu().numpy(), rec.detach().cpu().numpy())
+    print(metric)
+    tracker_val.collect(locals())
     model.train()
-    print(metrics(x.detach().cpu().numpy(), rec.detach().cpu().numpy()))
     return CE/n, 0
 
 
@@ -156,7 +151,7 @@ def train_distributed(rank_, world_size_, ddp_=True):
     
     encoder = ImgEncoderSingle()
     
-    model, optimizer, temp_scheduler = init_model(lr, SEED)
+    model, optimizer, temp_scheduler = init_model(params['lr'], SEED)
     
     if use_scheduler:
         scheduler = InversePowerWithWarmupLRScheduler(optimizer, peak_lr=peak_lr, warmup_steps=warmup_steps, power=power, shift=shift)
@@ -177,13 +172,16 @@ def train_distributed(rank_, world_size_, ddp_=True):
     np.random.seed(SEED)
 
     LS = {'rec_loss':[], 'lr':[], 'val_rec_loss':[], 'val_acc':[], 'grads':defaultdict(lambda:[]), 'total_grad':[]}
+    tracker = Tracker('lr rec_loss vq_loss pad_loss loss1 temp total_norm')
+    tracker_val = Tracker('metric')
 
     i_step = -1# if continue_params.get('i_step') is None else continue_params['i_step']-1
     best_ce = float('inf')
     patience = 0
     ep = -1 #if continue_params.get('ep') is None else continue_params['ep']-1
     
-    rec_w = 1.0
+    pad_loss_w = 0.1
+    target_noise_w = 0.05
     assert hasattr(model.module.quantize, 'temperature')
     
     
@@ -210,11 +208,9 @@ def train_distributed(rank_, world_size_, ddp_=True):
                     rec_loss = F.mse_loss(rec[mask], x[mask])
 #                     k = torch.topk(torch.abs(rec[~mask]), 1024*rec.shape[0])[0]
                     k = rec[~mask]
-                    pad_loss = F.mse_loss(k, torch.zeros_like(k)*torch.randn_like(k)*0.05)
-                    loss = rec_w*rec_loss + pad_loss*0.1 
-                    loss1 = loss + vq_loss*0.01
-
-                    loss = loss1 #+ loss2
+                    pad_loss = F.mse_loss(k, torch.zeros_like(k)+torch.randn_like(k)*target_noise_w)
+                    loss1 = rec_loss + pad_loss*pad_loss_w
+                    loss = loss1 + vq_loss*0.01
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -229,24 +225,26 @@ def train_distributed(rank_, world_size_, ddp_=True):
 
                     if rank == 0:
                         # LOGS
+                        lr = optimizer.param_groups[0]['lr']
+                        temp = model.module.quantize.temperature
                         LS['rec_loss'] += [rec_loss.item()]
                         LS['lr'] += [optimizer.param_groups[0]['lr']]
                         if LOG_ALL_GRADS:
                             [LS['grads'][k].append(torch.norm(v.grad).item()) for k,v in model.named_parameters() if v.requires_grad]
                         writer.add_scalar(f'Train/loss', loss.item(), i_step)
-                        writer.add_scalar(f'Train/rec_loss', rec_loss.item(), i_step)
-                        writer.add_scalar(f'Train/pad_loss', pad_loss.item(), i_step)
-                        writer.add_scalar(f'Train/vq_loss', vq_loss.item(), i_step)
+#                         writer.add_scalar(f'Train/rec_loss', rec_loss.item(), i_step)
+#                         writer.add_scalar(f'Train/pad_loss', pad_loss.item(), i_step)
+#                         writer.add_scalar(f'Train/vq_loss', vq_loss.item(), i_step)
                         
-                        writer.add_scalar(f'Train/vq_temp', model.module.quantize.temperature, i_step)
-                        writer.add_scalar(f'Train/lr', optimizer.param_groups[0]['lr'], i_step)
+#                         writer.add_scalar(f'Train/vq_temp', model.module.quantize.temperature, i_step)
+#                         writer.add_scalar(f'Train/lr', optimizer.param_groups[0]['lr'], i_step)
                         
-                        writer.add_scalar(f'TrainNorms/embedding_weight_norm', torch.norm(model.module.quantize.embed.weight).item(), i_step)
-                        writer.add_scalar(f'TrainNorms/embedding_grad_norm', torch.norm(model.module.quantize.embed.weight.grad).item(), i_step)
-                        writer.add_scalar(f'TrainNorms/output_weight_norm', torch.norm(model.module.decoder.conv_out.weight).item(), i_step)
-                        writer.add_scalar(f'TrainNorms/output_grad_norm', torch.norm(model.module.decoder.conv_out.weight.grad).item(), i_step)
-                        writer.add_scalar(f'TrainNorms/input_weight_norm', torch.norm(model.module.encoder.conv_in.weight).item(), i_step)
-                        writer.add_scalar(f'TrainNorms/input_grad_norm', torch.norm(model.module.encoder.conv_in.weight.grad).item(), i_step)
+#                         writer.add_scalar(f'TrainNorms/embedding_weight_norm', torch.norm(model.module.quantize.embed.weight).item(), i_step)
+#                         writer.add_scalar(f'TrainNorms/embedding_grad_norm', torch.norm(model.module.quantize.embed.weight.grad).item(), i_step)
+#                         writer.add_scalar(f'TrainNorms/output_weight_norm', torch.norm(model.module.decoder.conv_out.weight).item(), i_step)
+#                         writer.add_scalar(f'TrainNorms/output_grad_norm', torch.norm(model.module.decoder.conv_out.weight.grad).item(), i_step)
+#                         writer.add_scalar(f'TrainNorms/input_weight_norm', torch.norm(model.module.encoder.conv_in.weight).item(), i_step)
+#                         writer.add_scalar(f'TrainNorms/input_grad_norm', torch.norm(model.module.encoder.conv_in.weight.grad).item(), i_step)
                         if LOG_TOTAL_NORM:
                             total_norm = 0.
                             for p in model.parameters():
@@ -257,11 +255,12 @@ def train_distributed(rank_, world_size_, ddp_=True):
                             total_norm = total_norm ** 0.5
                             LS['total_grad'].append(total_norm)
                             writer.add_scalar(f'TrainNorms/total_grad_norm', total_norm, i_step)
-                        bar.set_postfix(loss=loss.item(), rec_loss=rec_loss.item(), lr=optimizer.param_groups[0]['lr'], norm=total_norm, ep=ep, step=i_step, avq_temp=model.module.quantize.temperature, rec_w=rec_w)
+                        bar.set_postfix(loss=loss.item(), rec_loss=rec_loss.item(), lr=optimizer.param_groups[0]['lr'], norm=total_norm, ep=ep, step=i_step, avq_temp=model.module.quantize.temperature)
+                        tracker.collect(locals())
 
                     if i_step % val_every == val_every-1:
                         writer.add_image('rec', rec[0].detach().cpu().numpy(), i_step+1)
-                        val_ce, val_acc = validate(model, val_loader)
+                        val_ce, val_acc = validate(model, val_loader, tracker_val)
                         if world_size > 1 and ddp:
                             ce_all, acc_all = [[torch.zeros(1,device=device) for i in range(world_size)] for _ in range(2)]
                             [torch.distributed.all_gather(a, torch.tensor(x, dtype=torch.float32, device=device)) for a,x in zip([ce_all,acc_all], [val_ce,val_acc])]
@@ -282,7 +281,7 @@ def train_distributed(rank_, world_size_, ddp_=True):
                     # CHECKPOINT
                     if (i_step % save_every == save_every-1) and rank == 0:
                         LS['grads'] = dict(LS['grads'])
-                        torch.save({'history':LS,'epoch':ep,'params':params}, f'{save_dir}/hist_{save_name}.pt')
+                        torch.save({'history':LS,'tracker':tracker,'tracker_val':tracker_val,'epoch':ep,'params':params}, f'{save_dir}/hist_{save_name}.pt')
                         torch.save(model.module.state_dict(), f'{save_dir}/model_{save_name}_{(i_step+1)//1000}k.pt')
                         if save_optimizer:
                             torch.save(optimizer.state_dict(), f'{save_dir}/optimizer_{save_name}_{(i_step+1)//1000}k.pt')

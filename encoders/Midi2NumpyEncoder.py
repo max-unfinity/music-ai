@@ -25,7 +25,8 @@ class Midi2NumpyEncoder(BaseEncoder):
             midi, is_corrupted = self._load_midi(file)
         except Exception as e:
             return None
-        notes = [np.array([[x.start,x.end,x.pitch,x.velocity] for x in inst.notes], dtype=self.dtype) for inst in midi.instruments if len(inst.notes)>9]
+        midi.instruments = [inst for inst in midi.instruments if len(inst.notes) >= 5]
+        notes = [np.array([[x.start,x.end,x.pitch,x.velocity] for x in inst.notes], dtype=self.dtype) for inst in midi.instruments]
         if not notes:
             return None
         _info = [[inst.program if not inst.is_drum else -1, inst.name] for inst in midi.instruments]

@@ -134,6 +134,7 @@ def get_midi_stats(midi, note_duration_step=0.1, note_duration_k=2, tempo_step=1
 
 
 def get_starts_ends(notes, return_sort=False):
+    '''start2start, end2start, i_sort_start, i_sort_end'''
     i_sort_start = np.argsort(notes[:,0])
     i_sort_end = np.argsort(notes[:,1])
     end2start = notes[i_sort_start,0][1:] - notes[i_sort_end,1][:-1]

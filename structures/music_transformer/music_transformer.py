@@ -73,8 +73,10 @@ class MusicTransformer(nn.Module):
         A prediction at one index is the "next" prediction given all information seen previously.
         ----------
         """
-        if (causal_mask is True):
+        if causal_mask is True:
             mask = self.mask[..., :x.shape[0], :x.shape[0]]
+        elif isinstance(causal_mask, torch.Tensor):
+            mask = causal_mask
         else:
             mask = None
             
